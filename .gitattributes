@@ -1,0 +1,2 @@
+artifacts/** filter=lfs diff=lfs merge=lfs -text
+e5_avito_pilot2_final/** filter=lfs diff=lfs merge=lfs -text
