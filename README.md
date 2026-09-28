@@ -3,201 +3,228 @@
 Решение тестового задания по генерации кандидатов для поиска в категории услуг.
 
 Для каждого поискового запроса требуется выбрать до 50 объявлений из общего корпуса.  
-Основная цель — максимизировать `Recall@50`.
+Целевая метрика — `Recall@50`.
 
 ## Структура проекта
 
 ```text
 .
-├── candidate_generation.ipynb      # основной pipeline и генерация answer.csv
+├── candidate generation.ipynb      # основной pipeline и генерация answer.csv
 ├── train_e5.ipynb                  # двухэтапный fine-tuning multilingual E5
-├── answer.csv                      # итоговый файл с предсказаниями
-│
-├── e5_avito_pilot2_final/          # готовый checkpoint финальной E5-модели
-│
-├── artifacts/                      # предрассчитанные embeddings и retrieval-кэши
-│   ├── item_embeddings_e5_avito_pilot2.npy 
-│   ├── val_embeddings_e5_avito_pilot2.npy
-│   ├── benchmark_query_embeddings_ft2.npy
-│   ├── dense_e5_avito_pilot2_indices_top1000.npy
-│   ├── dense_e5_avito_pilot2_scores_top1000.npy
-│   ├── benchmark_ft2_dense_indices_top1000.npy
-│   ├── benchmark_ft2_dense_scores_top1000.npy
-│   ├── lexical_tfidf_indices_top1000.npy
-│   ├── benchmark_lexical_indices_top1000.npy
-│   ├── char_tfidf_indices_top1000.npy
-│   ├── benchmark_char_tfidf_indices_top1000.npy
-│   ├── description_tfidf_indices_top1000.npy
-│   ├── benchmark_description_tfidf_indices_top1000.npy
-│   └── catboost_ranker_final.cbm
-└── 
-    
+├── answer.csv
+├── e5_avito_pilot2_final/          # финальный checkpoint E5
+├── artifacts/                      # retrieval-кэши и CatBoost model
+└── dataset/                        # локально, не хранится в Git
 ```
 
 ## Общая схема решения
 
-Решение состоит из двух этапов:
+Pipeline состоит из двух частей:
 
-1. генерация большого набора кандидатов несколькими независимыми retrieval-моделями;
-2. отбор финальных 50 кандидатов с помощью `CatBoostRanker`.
+1. генерация широкого набора кандидатов несколькими retrieval-моделями;
+2. reranking top-300 кандидатов с помощью `CatBoostRanker`.
 
 Используются четыре retrieval-канала:
 
 - fine-tuned `intfloat/multilingual-e5-small`;
 - word-level TF-IDF;
 - character-level TF-IDF;
-- word-level TF-IDF с добавлением текста описания объявления.
+- TF-IDF по `title + params + description`.
 
-Для каждого канала извлекается до 1000 кандидатов. Затем их объединение дополнительно оценивается по semantic similarity и location prior, после чего предварительно отбираются top-300 кандидатов. Финальные top-50 выбираются CatBoost ranker.
+Каждый канал возвращает top-1000. После объединения кандидаты предварительно ранжируются по semantic similarity, location prior и слабому lexical signal. Затем CatBoost выбирает финальные top-50.
+
+---
+
+## Как формировалась архитектура
+
+### Анализ данных
+
+Только `907 / 2452 = 36.99%` benchmark-запросов уже встречались в train по `search_query`, а полное совпадение всех query-признаков есть только для 108 запросов. Кроме того, лишь `6.63%` train-строк содержат item из benchmark corpus. Поэтому решение нельзя строить на запоминании query-item пар.
+
+Категория также оказалась слабым фильтром: хотя в train `search_category == item_category_id` для 99.99% positive-пар, в benchmark почти весь corpus относится к категории `114`.
+
+Location, наоборот, оказался сильным сигналом: exact match наблюдается в 83.10% positive-пар. Но жёстко фильтровать по location нельзя, поэтому используется soft prior:
+
+```text
+P(item_location_id | search_location_id)
+```
+
+Weighted coverage наиболее частых item locations:
+
+| Top-K locations | Coverage |
+|---:|---:|
+| 1 | 90.31% |
+| 5 | 95.61% |
+| 10 | 97.16% |
+
+Microcategory prior тоже проверялся, но после fine-tuning E5 почти не улучшал Recall@50, поэтому в финальную схему не вошёл.
+
+---
 
 ## Валидация
 
-Для локальной оценки была сформирована validation-выборка из 2452 запросов:
-
-- 907 `seen` запросов — query text встречается в обучающей выборке, но соответствующая hidden query-item пара удаляется;
-- 1545 `unseen` запросов — query text полностью исключается из обучающей выборки.
-
-Relevant item выбирается только среди объявлений, присутствующих в `benchmark_items.parquet`.
-
-Такая схема позволяет отдельно оценивать качество на уже встречавшихся и новых формулировках запросов и не использовать скрытые positive-пары при обучении.
-
-## Fine-tuning E5
-
-Dense retriever основан на:
+Validation повторяет структуру benchmark:
 
 ```text
-intfloat/multilingual-e5-small
+seen:    907
+unseen: 1545
 ```
 
-Текстовые представления:
+Для `seen` скрытая query-item пара удаляется, но query text остаётся в train.  
+Для `unseen` query text полностью исключается из train.
+
+Это позволяет избежать завышенной оценки из-за повторяющихся запросов и отдельно проверить перенос на новые формулировки.
+
+---
+
+## Dense retrieval и fine-tuning E5
+
+В качестве dense retriever выбран `intfloat/multilingual-e5-small`: модель мультиязычная, подходит для retrieval и достаточно компактна для локального запуска на MPS.
+
+Используемые тексты:
 
 ```text
 query: <search_query>. <search_infm_params_text>
 passage: <item_title_raw>. <item_infm_params_text>
 ```
 
-Описание объявления в E5 не используется и обрабатывается отдельным TF-IDF каналом.
+Zero-shot E5:
 
-Fine-tuning выполняется в `train_e5.ipynb` в два этапа.
+| K | Recall |
+|---:|---:|
+| 50 | 0.3120 |
+| 1000 | 0.7529 |
+
+Высокая разница между Recall@50 и Recall@1000 показала, что важны и широкий candidate pool, и отдельный reranking.
 
 ### FT1
 
-Для каждого уникального query выбирается одна positive query-item пара.
-
-Основные параметры:
+Fine-tuning выполняется через `MultipleNegativesRankingLoss` и `BatchSamplers.NO_DUPLICATES`.
 
 ```text
-loss: MultipleNegativesRankingLoss
-epochs: 1
-batch size: 32
-learning rate: 2e-5
-max sequence length: 128
-batch sampler: NO_DUPLICATES
+pairs = 104 063
+epochs = 1
+batch_size = 32
+learning_rate = 2e-5
+max_seq_length = 128
 ```
 
-После первого этапа сохраняется промежуточный checkpoint:
+Параметры выбирались как практический компромисс между качеством и временем обучения на MPS.
+
+После FT1:
 
 ```text
-e5_avito_pilot_final/
+Recall@50   = 0.3601
+Recall@1000 = 0.8544
 ```
 
 ### FT2
 
-На втором этапе обучение продолжается с checkpoint FT1.
+Для query с несколькими positive items на втором этапе по возможности используется другой positive. Альтернативный positive удалось подобрать для `36 112 / 104 063 = 34.70%` запросов.
 
-Для запросов с несколькими positive items по возможности выбирается другой positive item. В исходном обучении альтернативный positive удалось использовать для 36 112 из 104 063 запросов.
+FT2 продолжает обучение FT1 с меньшим `learning_rate=1e-5`.
 
-Параметры:
-
-```text
-loss: MultipleNegativesRankingLoss
-epochs: 1
-batch size: 32
-learning rate: 1e-5
-max sequence length: 128
-batch sampler: NO_DUPLICATES
-```
-
-Итоговый checkpoint:
+После FT2:
 
 ```text
-e5_avito_pilot2_final/
+Recall@50   = 0.3679
+Recall@1000 = 0.8613
 ```
 
-Именно он используется в основном pipeline.
+Поэтому в финальном pipeline используется `e5_avito_pilot2_final`.
 
-## Candidate retrieval
+---
 
-### Dense retrieval
+## Почему добавлены TF-IDF retrieval-каналы
 
-Для всех объявлений и запросов вычисляются L2-нормализованные E5 embeddings размерности 384.
-
-Cosine similarity вычисляется как скалярное произведение нормализованных векторов. Для каждого запроса выбираются top-1000 объявлений.
+Dense retrieval хорошо ловит смысл, но lexical методы лучше работают с точными названиями услуг, редкими словами, числами и опечатками.
 
 ### Word TF-IDF
 
-Используемый текст:
-
 ```text
-query: search_query + search_infm_params_text
-item: item_title_raw + item_infm_params_text
-```
-
-Параметры:
-
-```text
-analyzer = word
 ngram_range = (1, 2)
 min_df = 2
-max_features = 200000
+max_features = 200_000
 sublinear_tf = True
 ```
 
-### Character TF-IDF
+Standalone `Recall@1000 = 0.6060`, но в union:
 
-Используется для устойчивости к опечаткам, вариациям написания и редким терминам.
+```text
+FT2 dense:      0.8613
+FT2 ∪ word:     0.8887
+```
+
+Word retrieval дополнительно нашёл 67 relevant items, пропущенных dense retriever.
+
+### Character TF-IDF
 
 ```text
 analyzer = char_wb
 ngram_range = (3, 5)
-min_df = 2
-max_features = 150000
+max_features = 150_000
+```
+
+Он устойчивее к опечаткам и вариациям написания:
+
+```text
+FT2 ∪ word:        0.8887
++ char:             0.9005
 ```
 
 ### Description TF-IDF
 
-В item representation дополнительно добавляются первые 1500 символов `item_description_raw`.
+Описание не добавлялось напрямую в E5, чтобы не перегружать embedding длинным рекламным текстом. Вместо этого сделан отдельный sparse channel:
 
 ```text
-item = title + params + description[:1500]
-query = search_query + search_infm_params_text
+title + params + description[:1500]
 ```
 
-## Location prior
-
-По обучающим данным оценивается:
+Он дал самый заметный дополнительный прирост coverage:
 
 ```text
-P(item_location_id | search_location_id)
+FT2 ∪ word ∪ char:       0.9005
++ description:            0.9335
 ```
 
-Локация используется только как soft feature, а не как жёсткий фильтр.
+Description спас 81 из 244 оставшихся misses.
 
-Для локальной validation prior строится по leakage-safe train. Для benchmark используется весь доступный `train.parquet`.
+---
 
-## Объединение кандидатов
+## Почему location weight = 0.50
 
-Top-1000 кандидатов четырёх retrieval-каналов объединяются.
+Проверялся score:
 
-Для каждого кандидата сохраняются:
+```text
+semantic + alpha * location_prior
+```
 
-- E5 semantic score;
-- location prior;
-- exact location match;
-- rank в каждом retrieval-канале;
-- индикатор присутствия кандидата в каждом retrieval-канале.
+После `alpha ≈ 0.4` начинается плато:
 
-Для предварительного отбора используется score:
+| alpha | Recall@50 |
+|---:|---:|
+| 0.20 | 0.7606 |
+| 0.30 | 0.7785 |
+| 0.40 | 0.7851 |
+| 0.50 | 0.7867 |
+| 0.75 | 0.7863 |
+| 1.00 | 0.7871 |
+
+В финальном pipeline оставлено `0.50`: это сильный location signal, но он не доминирует над semantic similarity.
+
+---
+
+## Candidate union и top-300
+
+Финальный candidate pool — объединение четырёх top-1000 retrieval channels.
+
+Coverage полного union:
+
+```text
+2289 / 2452 = 93.35%
+```
+
+Перед CatBoost используется дешёвый score:
 
 ```text
 semantic
@@ -205,40 +232,34 @@ semantic
 + 0.005 * word_rank
 ```
 
-По нему выбираются top-300 кандидатов.
+Manual ranking:
 
-## CatBoost ranker
+| K | Recall |
+|---:|---:|
+| 50 | 0.8373 |
+| 100 | 0.8764 |
+| 200 | 0.9025 |
+| 300 | 0.9139 |
+| 500 | 0.9233 |
 
-Финальный `CatBoostRanker` переупорядочивает top-300 кандидатов.
+Поэтому выбрано `PRE_K=300`: coverage остаётся высоким, а число объектов для ML-reranker значительно уменьшается.
 
-Используются 17 признаков:
+---
+
+## CatBoostRanker
+
+Для каждого из 300 кандидатов используются 17 признаков:
 
 ```text
-semantic
-location_prior
-exact_location
-
-dense_rank
-word_rank
-char_rank
-desc_rank
-
-in_dense
-in_word
-in_char
-in_desc
-
-rating
-log_reviews
-log_price
-
-phone_hidden
-message_forbidden
-
+semantic, location_prior, exact_location,
+dense_rank, word_rank, char_rank, desc_rank,
+in_dense, in_word, in_char, in_desc,
+rating, log_reviews, log_price,
+phone_hidden, message_forbidden,
 query_has_params
 ```
 
-Параметры модели:
+Параметры:
 
 ```text
 loss_function = YetiRank
@@ -246,63 +267,78 @@ iterations = 500
 depth = 6
 learning_rate = 0.05
 l2_leaf_reg = 5
-random_seed = 42
 ```
 
-На локальной OOF-валидации CatBoost улучшил `Recall@50` относительно ручного pre-ranking.
+Большой hyperparameter search не проводился, чтобы не переобучаться на небольшой validation. Качество проверялось через 3-fold OOF.
+
+Результаты:
+
+```text
+Manual Recall@50:   0.837276
+CatBoost Recall@50: 0.853589
+seen:               0.868798
+unseen:             0.844660
+```
+
+CatBoost спас 67 запросов и потерял 27, net gain — `+40`.
+
+---
+
+## Итоговая архитектура
+
+```text
+E5 FT2 top-1000 ─────────────┐
+Word TF-IDF top-1000 ────────┤
+Char TF-IDF top-1000 ────────┼─> union, coverage 93.35%
+Description TF-IDF top-1000 ─┘
+                              │
+                              ▼
+             semantic + location + weak word rank
+                              │
+                              ▼
+                     top-300, coverage 91.39%
+                              │
+                              ▼
+                    CatBoostRanker
+                              │
+                              ▼
+                           top-50
+```
+
+Главная идея решения — разделить **candidate recall** и **final ranking**. Retrieval-каналы компенсируют ошибки друг друга, а CatBoost уже выбирает лучшие 50 из сильных 300 кандидатов.
+
+---
 
 ## Запуск
 
-### Быстрое воспроизведение итогового результата
+### Быстрое воспроизведение
 
 Для генерации `answer.csv` повторный fine-tuning E5 не требуется.
 
-Необходимо наличие:
+Нужны:
 
 ```text
-dataset/ (в который необходимо поместить все исходные файлы .parquet)
-candidate_generation.ipynb
+dataset/
+e5_avito_pilot2_final/
+artifacts/
+candidate generation.ipynb
 ```
 
-После этого достаточно открыть:
+Запустить все ячейки `candidate generation.ipynb`.
+
+Самый большой cache-файл `item_embeddings_e5_avito_pilot2.npy` не хранится в Git и при необходимости пересчитывается из E5 checkpoint.
+
+### Полное воспроизведение
 
 ```text
-candidate_generation.ipynb
+1. train_e5.ipynb
+2. получение e5_avito_pilot2_final/
+3. candidate generation.ipynb
 ```
 
-и выполнить все ячейки.
-
-Если готовые `.npy` artifacts присутствуют, они загружаются из кэша. Если соответствующий кэш отсутствует, основной notebook может пересчитать необходимые представления из сохранённого E5 checkpoint.
-
-### Полное воспроизведение обучения
-
-Для повторного обучения dense retriever:
-
-1. запустить `train_e5.ipynb`;
-2. получить `e5_avito_pilot2_final/`;
-3. запустить `candidate_generation.ipynb`.
-
-Два этапа fine-tuning являются наиболее долгими частями pipeline.
-
-## Формат результата
-
-Итоговый файл:
-
-```text
-answer.csv
-```
-
-содержит два столбца:
-
-```text
-query_id,answer
-```
-
-где `answer` — строка из 50 `item_id`, разделённых пробелами.
+---
 
 ## Зависимости
-
-Основные библиотеки:
 
 ```text
 Python 3.12
@@ -319,10 +355,4 @@ catboost
 jupyterlab
 ```
 
-На Apple Silicon автоматически может использоваться `MPS`. При его отсутствии код может выполняться на CUDA или CPU.
-
-## Примечание о воспроизводимости
-
-Для быстрого и максимально точного воспроизведения submission используется сохранённый checkpoint `e5_avito_pilot2_final` и готовые artifacts.
-
-Код полного обучения модели приведён отдельно в `train_e5.ipynb`. Повторное обучение E5 не требуется для генерации итогового `answer.csv`.
+На Apple Silicon используется MPS; при его отсутствии возможен CUDA/CPU fallback.
